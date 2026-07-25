@@ -1,6 +1,6 @@
 import socket
 
-from server import Error, ProtocolHandler
+from server import Error, ProtocolHandler, SimpleString
 
 
 class Client(object):
@@ -15,6 +15,8 @@ class Client(object):
         resp = self._protocol.handle_request(self._fh)
         if isinstance(resp, Error):
             raise Exception(resp.message)
+        if isinstance(resp, SimpleString):
+            return resp.value
         return resp
 
     def get(self, key):
@@ -35,6 +37,18 @@ class Client(object):
     def mset(self, *items):
         return self.execute('MSET', *items)
 
+    def save(self):
+        return self.execute('SAVE')
+
+    def multi(self):
+        return self.execute('MULTI')
+
+    def discard(self):
+        return self.execute('DISCARD')
+
+    def exec_(self):
+        return self.execute('EXEC')
+
 
 if __name__ == '__main__':
     client = Client()
@@ -45,3 +59,11 @@ if __name__ == '__main__':
     print('MGET a b ->', client.mget('a', 'b'))
     print('DELETE foo ->', client.delete('foo'))
     print('GET foo (after delete) ->', client.get('foo'))
+
+    print('SAVE ->', client.save())
+
+    print('MULTI ->', client.multi())
+    print('  SET x 1 ->', client.set('x', '1'))
+    print('  SET y 2 ->', client.set('y', '2'))
+    print('  GET x ->', client.get('x'))
+    print('EXEC ->', client.exec_())

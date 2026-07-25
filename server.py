@@ -1,6 +1,9 @@
+import os
+import pickle
 from collections import namedtuple
 from io import BytesIO
 
+import gevent
 from gevent.pool import Pool
 from gevent.server import StreamServer
 
@@ -14,6 +17,7 @@ class Disconnect(Exception):
 
 
 Error = namedtuple('Error', ('message',))
+SimpleString = namedtuple('SimpleString', ('value',))
 
 
 class ProtocolHandler(object):
@@ -82,6 +86,8 @@ class ProtocolHandler(object):
             buf.write(b':%d\r\n' % (1 if data else 0))
         elif isinstance(data, int):
             buf.write(b':%d\r\n' % data)
+        elif isinstance(data, SimpleString):
+            buf.write(b'+%b\r\n' % data.value.encode('utf-8'))
         elif isinstance(data, Error):
             buf.write(b'-%b\r\n' % data.message.encode('utf-8'))
         elif isinstance(data, (list, tuple)):
@@ -100,12 +106,16 @@ class ProtocolHandler(object):
 
 
 class Server(object):
-    def __init__(self, host='127.0.0.1', port=31337, max_clients=64):
+    def __init__(self, host='127.0.0.1', port=31337, max_clients=64,
+                 dump_path='dump.rdb', autosave_interval=None):
         self._pool = Pool(max_clients)
         self._server = StreamServer(
             (host, port), self.connection_handler, spawn=self._pool)
         self._protocol = ProtocolHandler()
+        self._dump_path = dump_path
+        self._autosave_interval = autosave_interval
         self._kv = {}
+        self._load()
         self._commands = self.get_commands()
 
     def get_commands(self):
@@ -116,10 +126,13 @@ class Server(object):
             'FLUSH': self.flush,
             'MGET': self.mget,
             'MSET': self.mset,
+            'SAVE': self.save,
         }
 
     def connection_handler(self, conn, address):
         socket_file = conn.makefile('rwb')
+        in_transaction = False
+        transaction_queue = []
 
         while True:
             try:
@@ -128,13 +141,50 @@ class Server(object):
                 break
 
             try:
-                resp = self.get_response(data)
+                data = self.normalize_request(data)
+                command = self.get_command_name(data)
             except CommandError as exc:
-                resp = Error(exc.args[0])
+                self._protocol.write_response(socket_file, Error(exc.args[0]))
+                continue
+
+            if command == 'MULTI':
+                if in_transaction:
+                    resp = Error('MULTI calls can not be nested')
+                else:
+                    in_transaction = True
+                    transaction_queue = []
+                    resp = SimpleString('OK')
+            elif command == 'DISCARD':
+                if not in_transaction:
+                    resp = Error('DISCARD without MULTI')
+                else:
+                    in_transaction = False
+                    transaction_queue = []
+                    resp = SimpleString('OK')
+            elif command == 'EXEC':
+                if not in_transaction:
+                    resp = Error('EXEC without MULTI')
+                else:
+                    in_transaction = False
+                    resp = []
+                    for queued in transaction_queue:
+                        try:
+                            resp.append(self.get_response(queued))
+                        except CommandError as exc:
+                            resp.append(Error(exc.args[0]))
+                    transaction_queue = []
+            elif in_transaction:
+                transaction_queue.append(data)
+                resp = SimpleString('QUEUED')
+            else:
+                try:
+                    resp = self.get_response(data)
+                except CommandError as exc:
+                    resp = Error(exc.args[0])
 
             self._protocol.write_response(socket_file, resp)
 
-    def get_response(self, data):
+    def normalize_request(self, data):
         if not isinstance(data, list):
             try:
                 data = data.split()
@@ -144,9 +194,17 @@ class Server(object):
         if not data:
             raise CommandError('Missing command')
 
-        command = data[0].upper()
+        return data
+
+    def get_command_name(self, data):
+        command = data[0]
         if isinstance(command, bytes):
             command = command.decode('utf-8')
+        return command.upper()
+
+    def get_response(self, data):
+        data = self.normalize_request(data)
+        command = self.get_command_name(data)
 
         if command not in self._commands:
             raise CommandError('Unrecognized command: %s' % command)
@@ -180,12 +238,45 @@ class Server(object):
             self._kv[key] = value
         return len(items) // 2
 
+    def save(self):
+        with open(self._dump_path, 'wb') as fh:
+            pickle.dump(self._kv, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        return SimpleString('OK')
+
+    def _load(self):
+        if not os.path.exists(self._dump_path):
+            return
+        with open(self._dump_path, 'rb') as fh:
+            try:
+                self._kv = pickle.load(fh)
+            except (EOFError, pickle.UnpicklingError):
+                self._kv = {}
+
+    def _autosave_loop(self):
+        while True:
+            gevent.sleep(self._autosave_interval)
+            self.save()
+
     def run(self):
+        if self._autosave_interval:
+            gevent.spawn(self._autosave_loop)
         self._server.serve_forever()
 
 
 if __name__ == '__main__':
+    import argparse
+
     from gevent import monkey
     monkey.patch_all()
 
-    Server().run()
+    parser = argparse.ArgumentParser(description='Run the redis clone server.')
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=31337)
+    parser.add_argument('--dump-path', default='dump.rdb',
+                         help='path to load/save the snapshot file')
+    parser.add_argument('--autosave', type=int, default=None,
+                         help='autosave interval in seconds (disabled by default)')
+    args = parser.parse_args()
+
+    Server(host=args.host, port=args.port, dump_path=args.dump_path,
+           autosave_interval=args.autosave).run()
