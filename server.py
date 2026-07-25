@@ -1,5 +1,6 @@
 import os
 import pickle
+import tempfile
 from collections import namedtuple
 from io import BytesIO
 
@@ -123,7 +124,9 @@ class Server(object):
             'GET': self.get,
             'SET': self.set,
             'DELETE': self.delete,
+            'DEL': self.delete,
             'FLUSH': self.flush,
+            'FLUSHDB': self.flush,
             'MGET': self.mget,
             'MSET': self.mset,
             'SAVE': self.save,
@@ -216,7 +219,7 @@ class Server(object):
 
     def set(self, key, value):
         self._kv[key] = value
-        return 1
+        return SimpleString('OK')
 
     def delete(self, key):
         if key in self._kv:
@@ -239,8 +242,22 @@ class Server(object):
         return len(items) // 2
 
     def save(self):
-        with open(self._dump_path, 'wb') as fh:
-            pickle.dump(self._kv, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        # Snapshot the dict before writing so the on-disk data reflects one
+        # consistent point in time even if something about the write path
+        # changes later (e.g. a thread-backed file writer) and stops being
+        # implicitly atomic with respect to other greenlets.
+        snapshot = dict(self._kv)
+
+        directory = os.path.dirname(os.path.abspath(self._dump_path))
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.dump-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'wb') as fh:
+                pickle.dump(snapshot, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, self._dump_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
         return SimpleString('OK')
 
     def _load(self):
