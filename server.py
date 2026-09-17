@@ -22,7 +22,31 @@ SimpleString = namedtuple('SimpleString', ('value',))
 
 
 class ProtocolHandler(object):
-    """Encodes/decodes the RESP (REdis Serialization Protocol) wire format."""
+    """Encodes/decodes the RESP (REdis Serialization Protocol) wire format.
+
+    Reads come from a buffered file-like object (typically a socket's
+    ``makefile()``). Using a buffered stream instead of raw ``recv()`` calls
+    means partial TCP reads and multiple pipelined commands sharing one TCP
+    read are already handled correctly by the stream's own buffering — a
+    ``readline()``/``read(n)`` call transparently blocks and accumulates
+    across as many underlying ``recv()`` calls as it takes. The hardening
+    below is about *malformed* input: bad lengths, truncated frames, and
+    frames that declare implausibly large sizes.
+    """
+
+    # Matches Redis's own default (proto-max-bulk-len). Declaring a length
+    # above this is almost certainly a malformed or hostile request, not a
+    # legitimate large value.
+    MAX_BULK_LEN = 512 * 1024 * 1024
+
+    # Matches Redis's hardcoded multibulk element-count ceiling.
+    MAX_ARRAY_ELEMENTS = 1024 * 1024
+
+    # Applies to any single line (simple strings, errors, integers, and
+    # length headers). Modeled on Redis's inline-command size limit; without
+    # a cap, a line with no "\r\n" would make readline() buffer unbounded
+    # amounts of memory waiting for a terminator that may never arrive.
+    MAX_LINE_LEN = 64 * 1024
 
     def __init__(self):
         self.handlers = {
@@ -42,31 +66,92 @@ class ProtocolHandler(object):
         try:
             handler = self.handlers[first_byte]
         except KeyError:
-            raise CommandError('bad request')
+            raise CommandError('bad request: unknown type byte %r' % first_byte)
         return handler(socket_file)
 
+    def _read_line(self, socket_file):
+        """Read one CRLF-terminated line, capped at MAX_LINE_LEN.
+
+        Raises Disconnect if the stream ended before a full line arrived
+        (a clean or unclean mid-frame close), and CommandError if a
+        terminator never showed up within the size cap (malformed/hostile
+        input rather than a dropped connection).
+        """
+        line = socket_file.readline(self.MAX_LINE_LEN + 1)
+        if not line:
+            raise Disconnect()
+        if not line.endswith(b'\r\n'):
+            if len(line) > self.MAX_LINE_LEN:
+                raise CommandError('line too long (max %d bytes)' % self.MAX_LINE_LEN)
+            raise Disconnect()
+        return line[:-2]
+
+    def _read_length(self, socket_file, label):
+        line = self._read_line(socket_file)
+        try:
+            return int(line)
+        except ValueError:
+            raise CommandError('invalid %s: not an integer' % label)
+
+    def _read_exact(self, socket_file, n):
+        """Read exactly n bytes, or raise Disconnect if the stream ended first.
+
+        A single read(n) call is enough for a real socket.makefile() (its
+        BufferedReader loops internally until n bytes or EOF), but looping
+        here too means correctness doesn't depend on that guarantee holding
+        for whatever file-like object is passed in.
+        """
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            chunk = socket_file.read(remaining)
+            if not chunk:
+                raise Disconnect()
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b''.join(chunks)
+
     def handle_simple_string(self, socket_file):
-        return socket_file.readline().rstrip(b'\r\n')
+        return self._read_line(socket_file)
 
     def handle_error(self, socket_file):
-        return Error(socket_file.readline().rstrip(b'\r\n'))
+        return Error(self._read_line(socket_file))
 
     def handle_integer(self, socket_file):
-        return int(socket_file.readline().rstrip(b'\r\n'))
+        return self._read_length(socket_file, 'integer')
 
     def handle_string(self, socket_file):
-        length = int(socket_file.readline().rstrip(b'\r\n'))
+        length = self._read_length(socket_file, 'bulk length')
         if length == -1:
-            return None
-        length += 2  # Include the trailing \r\n.
-        return socket_file.read(length)[:-2]
+            return None  # Null bulk string ($-1\r\n).
+        if length < -1:
+            raise CommandError('invalid bulk length: %d' % length)
+        if length > self.MAX_BULK_LEN:
+            raise CommandError(
+                'bulk length too large: %d bytes (max %d)' % (length, self.MAX_BULK_LEN))
+        payload = self._read_exact(socket_file, length + 2)  # + trailing \r\n
+        if payload[-2:] != b'\r\n':
+            raise CommandError('bad bulk string terminator')
+        return payload[:-2]
 
     def handle_array(self, socket_file):
-        num_elements = int(socket_file.readline().rstrip(b'\r\n'))
+        num_elements = self._read_length(socket_file, 'array length')
+        if num_elements == -1:
+            return None  # Null array (*-1\r\n).
+        if num_elements < -1:
+            raise CommandError('invalid array length: %d' % num_elements)
+        if num_elements > self.MAX_ARRAY_ELEMENTS:
+            raise CommandError(
+                'array length too large: %d (max %d)' % (num_elements, self.MAX_ARRAY_ELEMENTS))
         return [self.handle_request(socket_file) for _ in range(num_elements)]
 
     def handle_dict(self, socket_file):
-        num_items = int(socket_file.readline().rstrip(b'\r\n'))
+        num_items = self._read_length(socket_file, 'dict length')
+        if num_items < 0:
+            raise CommandError('invalid dict length: %d' % num_items)
+        if num_items * 2 > self.MAX_ARRAY_ELEMENTS:
+            raise CommandError(
+                'dict length too large: %d (max %d entries)' % (num_items, self.MAX_ARRAY_ELEMENTS // 2))
         elements = [self.handle_request(socket_file) for _ in range(num_items * 2)]
         return dict(zip(elements[::2], elements[1::2]))
 
@@ -142,6 +227,18 @@ class Server(object):
                 data = self._protocol.handle_request(socket_file)
             except Disconnect:
                 break
+            except CommandError as exc:
+                # A malformed frame desynchronizes the stream: we can no
+                # longer tell where the next valid frame starts. Unlike a
+                # command-level error (bad arity, unknown command), which
+                # leaves framing intact and the connection reusable, this
+                # is unrecoverable — report it and close, matching how real
+                # Redis responds to protocol errors it can't resync from.
+                try:
+                    self._protocol.write_response(socket_file, Error(exc.args[0]))
+                except Exception:
+                    pass
+                break
 
             try:
                 data = self.normalize_request(data)
@@ -202,7 +299,10 @@ class Server(object):
     def get_command_name(self, data):
         command = data[0]
         if isinstance(command, bytes):
-            command = command.decode('utf-8')
+            try:
+                command = command.decode('utf-8')
+            except UnicodeDecodeError:
+                raise CommandError('command name must be valid utf-8')
         return command.upper()
 
     def get_response(self, data):
@@ -265,9 +365,20 @@ class Server(object):
             return
         with open(self._dump_path, 'rb') as fh:
             try:
-                self._kv = pickle.load(fh)
-            except (EOFError, pickle.UnpicklingError):
-                self._kv = {}
+                data = pickle.load(fh)
+            except Exception:
+                # Any failure to unpickle the dump file (truncated,
+                # corrupted, or referencing a class that can no longer be
+                # resolved) degrades to an empty store rather than
+                # crashing startup entirely -- narrowly catching only
+                # EOFError/UnpicklingError missed other exception types
+                # (e.g. AttributeError from an unresolvable class) that
+                # are just as much "this file isn't usable".
+                data = {}
+        # A syntactically valid pickle of the wrong type (e.g. a list)
+        # would otherwise silently become self._kv, breaking every
+        # command for the life of the process.
+        self._kv = data if isinstance(data, dict) else {}
 
     def _autosave_loop(self):
         while True:
